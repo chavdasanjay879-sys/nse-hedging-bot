@@ -3,3 +3,5 @@ pytz
 schedule
 flask
 yfinance
+pandas
+numpy
