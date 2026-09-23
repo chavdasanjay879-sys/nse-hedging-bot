@@ -247,22 +247,18 @@ class RealisticPaperTradingBot:
         while True:
             now = datetime.now(IST)
 
-            # Check Telegram user commands continuously
             self.check_telegram_commands()
 
             if self.is_market_open():
-                # Market open hoy ane trade active na hoy to execute kare
                 for sym in self.indices:
                     if not self.indices[sym]["active"]:
                         self.execute_live_order(sym)
                         break
 
-                # Hourly auto update
                 if now.minute == 0 and self.last_pnl_hour != now.hour:
                     send_telegram_msg(self.get_status_summary())
                     self.last_pnl_hour = now.hour
 
-                # 03:15 PM Square-off
                 if now.hour == 15 and now.minute == 15:
                     for sym in self.indices:
                         self.indices[sym]["active"] = False
