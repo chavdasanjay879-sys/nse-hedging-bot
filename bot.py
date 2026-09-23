@@ -17,7 +17,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "NSE Virtual Capital & Realistic PnL Hedging Bot Running!"
+    return "NSE Smart Hedging Bot Running 24/7!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -42,10 +42,10 @@ def get_market_data(symbol):
     try:
         ticker = yf.Ticker(ticker_map[symbol])
         df = ticker.history(period="5d", interval="5m")
-        if not df.empty and len(df) >= 30:
+        if not df.empty and len(df) >= 20:
             return df
     except Exception as e:
-        print(f"Data fetch error for {symbol}: {e}")
+        print(f"Data error for {symbol}: {e}")
     return None
 
 def analyze_regime(df):
@@ -61,17 +61,16 @@ def analyze_regime(df):
     recent_low = df['Low'].iloc[-12:].min()
     range_pct = (recent_high - recent_low) / current_close * 100
 
-    if curr_ema9 > curr_ema21 and current_close > curr_ema9 and range_pct > 0.35:
+    if curr_ema9 > curr_ema21 and current_close > curr_ema9 and range_pct > 0.30:
         return "BULLISH_TREND"
-    elif curr_ema9 < curr_ema21 and current_close < curr_ema9 and range_pct > 0.35:
+    elif curr_ema9 < curr_ema21 and current_close < curr_ema9 and range_pct > 0.30:
         return "BEARISH_TREND"
     else:
         return "SIDEWAYS_RANGE"
 
-# Estimate realistic option premiums based on spot distance & theta
 def estimate_premium(spot, strike, opt_type):
     distance = abs(spot - strike)
-    base_atm = spot * 0.007  # approx ATM premium ~0.7% of spot
+    base_atm = spot * 0.007
     if opt_type == "CE":
         intrinsic = max(0, spot - strike)
     else:
@@ -81,7 +80,7 @@ def estimate_premium(spot, strike, opt_type):
 
 class RealisticPaperTradingBot:
     def __init__(self):
-        self.virtual_capital = 200000.0  # Starting Capital ₹2,00,000
+        self.virtual_capital = 200000.0
         self.starting_capital = 200000.0
         self.indices = {
             "NIFTY 50": {"step": 50, "hedge": 200, "lot_size": 25, "active": False, "trade": None},
@@ -89,6 +88,7 @@ class RealisticPaperTradingBot:
             "SENSEX": {"step": 100, "hedge": 500, "lot_size": 10, "active": False, "trade": None}
         }
         self.last_pnl_hour = -1
+        self.last_update_id = 0
 
     def is_market_open(self):
         now = datetime.now(IST)
@@ -158,12 +158,12 @@ class RealisticPaperTradingBot:
             legs_text += f"• {leg['action']} `{leg['strike']} {leg['type']}` @ ₹{leg['entry_prem']}\n"
 
         msg = (
-            f"💰 *[VIRTUAL LIVE ORDER EXECUTED]*\n\n"
+            f"⚡ *[LIVE ORDER EXECUTED]*\n\n"
             f"🎯 *Index:* `{symbol}` (Qty: {lot})\n"
             f"📈 *Live Spot:* `₹{spot}`\n"
             f"📊 *Market Trend:* `{regime}`\n"
             f"🛡️ *Strategy:* *{strat_name}*\n\n"
-            f"📋 *Executed Legs & Premiums:*\n{legs_text}\n"
+            f"📋 *Order Legs & Premiums:*\n{legs_text}\n"
             f"💼 *Account Capital:* `₹{self.virtual_capital:,.2f}`\n"
             f"⏱️ *Time:* `{datetime.now(IST).strftime('%I:%M:%S %p')}`"
         )
@@ -187,10 +187,10 @@ class RealisticPaperTradingBot:
 
         return round(total_pnl, 2)
 
-    def send_hourly_pnl(self):
-        msg = "📊 *[HOURLY REAL-TIME P&L REPORT]*\n\n"
+    def get_status_summary(self):
         has_trades = False
         net_running_pnl = 0.0
+        msg = "📊 *[LIVE STATUS & P&L]*\n\n"
 
         for sym, d in self.indices.items():
             if d["active"]:
@@ -199,77 +199,76 @@ class RealisticPaperTradingBot:
                 curr_spot = round(float(df['Close'].iloc[-1]), 2) if df is not None else d["trade"]["entry_spot"]
                 pnl = self.calculate_trade_pnl(sym, curr_spot)
                 net_running_pnl += pnl
-
                 status_emoji = "🟢" if pnl >= 0 else "🔴"
                 msg += (
                     f"• `{sym}` ({d['trade']['strategy']})\n"
                     f"  Spot: ₹{curr_spot} | P&L: {status_emoji} *₹{pnl:+,.2f}*\n\n"
                 )
 
-        if has_trades:
-            net_status = "🟢 PROFIT" if net_running_pnl >= 0 else "🔴 LOSS"
-            msg += (
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"💵 *Total Running P&L:* {net_status} `₹{net_running_pnl:+,.2f}`\n"
-                f"💼 *Virtual Balance:* `₹{(self.virtual_capital + net_running_pnl):,.2f}`"
-            )
-            send_telegram_msg(msg)
+        if not has_trades:
+            return "ℹ️ Atyare koi active open position nathi. Market open ma bot trade execute karshe."
 
-    def close_all_trades(self):
-        day_pnl = 0.0
-        msg = "🛑 *[INTRADAY SQUARE-OFF (03:15 PM)]*\n\n"
-
-        for sym, d in self.indices.items():
-            if d["active"]:
-                df = get_market_data(sym)
-                curr_spot = round(float(df['Close'].iloc[-1]), 2) if df is not None else d["trade"]["entry_spot"]
-                pnl = self.calculate_trade_pnl(sym, curr_spot)
-                day_pnl += pnl
-                d["active"] = False
-                d["trade"] = None
-
-                status_emoji = "🟢" if pnl >= 0 else "🔴"
-                msg += f"• `{sym}` Final P&L: {status_emoji} *₹{pnl:+,.2f}*\n"
-
-        self.virtual_capital += day_pnl
-        net_day_status = "🟢 NET PROFIT" if day_pnl >= 0 else "🔴 NET LOSS"
-
+        net_status = "🟢 PROFIT" if net_running_pnl >= 0 else "🔴 LOSS"
         msg += (
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🏁 *Day Summary:* {net_day_status} `₹{day_pnl:+,.2f}`\n"
-            f"💰 *Updated Total Capital:* `₹{self.virtual_capital:,.2f}`\n"
-            f"📈 *Overall ROI:* `{(self.virtual_capital - self.starting_capital) / self.starting_capital * 100:+.2f}%`"
+            f"💵 *Net Running P&L:* {net_status} `₹{net_running_pnl:+,.2f}`\n"
+            f"💼 *Virtual Balance:* `₹{(self.virtual_capital + net_running_pnl):,.2f}`"
         )
-        send_telegram_msg(msg)
+        return msg
+
+    def check_telegram_commands(self):
+        if not TELEGRAM_BOT_TOKEN:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {"offset": self.last_update_id + 1, "timeout": 1}
+        try:
+            res = requests.get(url, params=params, timeout=5).json()
+            if "result" in res:
+                for update in res["result"]:
+                    self.last_update_id = update["update_id"]
+                    if "message" in update and "text" in update["message"]:
+                        text = update["message"]["text"].strip().lower()
+                        chat_id = str(update["message"]["chat"]["id"])
+                        if chat_id == str(TELEGRAM_CHAT_ID):
+                            if text in ["/status", "status"]:
+                                send_telegram_msg(self.get_status_summary())
+                            elif text in ["/trade", "trade"]:
+                                for sym in self.indices:
+                                    if not self.indices[sym]["active"]:
+                                        self.execute_live_order(sym)
+                                        break
+        except Exception as e:
+            pass
 
     def run_loop(self):
         time.sleep(3)
-        send_telegram_msg(
-            "💼 *NSE Realistic Paper Trading Activated!*\n"
-            f"• Starting Virtual Capital: `₹{self.virtual_capital:,.2f}`\n"
-            "• Tracking: Premium, Lot Size & Real PnL (₹)"
-        )
+        send_telegram_msg("🚀 *NSE Bot Online & Command Listener Active!*\nSend `/status` anytime to check live P&L.")
 
         while True:
             now = datetime.now(IST)
 
-            if self.is_market_open():
-                # Market Entry at 09:20 AM
-                if now.hour == 9 and now.minute == 20:
-                    for sym in self.indices:
-                        if not self.indices[sym]["active"]:
-                            self.execute_live_order(sym)
+            # Check Telegram user commands continuously
+            self.check_telegram_commands()
 
-                # Hourly P&L Tracking
+            if self.is_market_open():
+                # Market open hoy ane trade active na hoy to execute kare
+                for sym in self.indices:
+                    if not self.indices[sym]["active"]:
+                        self.execute_live_order(sym)
+                        break
+
+                # Hourly auto update
                 if now.minute == 0 and self.last_pnl_hour != now.hour:
-                    self.send_hourly_pnl()
+                    send_telegram_msg(self.get_status_summary())
                     self.last_pnl_hour = now.hour
 
-                # 03:15 PM Square-Off
+                # 03:15 PM Square-off
                 if now.hour == 15 and now.minute == 15:
-                    self.close_all_trades()
+                    for sym in self.indices:
+                        self.indices[sym]["active"] = False
+                    send_telegram_msg("🛑 *[INTRADAY CLOSE]* All paper positions closed at 03:15 PM.")
 
-            time.sleep(30)
+            time.sleep(5)
 
 if __name__ == "__main__":
     bot = RealisticPaperTradingBot()
