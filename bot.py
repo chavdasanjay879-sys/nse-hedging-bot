@@ -1,305 +1,2942 @@
+```python
 import os
 import time
-import requests
+import math
 import threading
-from datetime import datetime
+from datetime import datetime, time as dt_time
+
+import requests
 import pytz
-import pandas as pd
 import numpy as np
+import pandas as pd
 import yfinance as yf
 from flask import Flask
 
+
+# ============================================================
+# ADVANCED OPTIONS SELLING + MANDATORY HEDGING ENGINE
+# PAPER TRADING ONLY
+# ============================================================
+
+IST = pytz.timezone("Asia/Kolkata")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-IST = pytz.timezone("Asia/Kolkata")
 
 app = Flask(__name__)
 
-@app.route('/')
+
+# ============================================================
+# GLOBAL SETTINGS
+# ============================================================
+
+STARTING_CAPITAL = 200000.0
+
+CACHE_SECONDS = 60
+
+STATUS_INTERVAL = 900
+
+MAX_DAILY_LOSS = 5000.0
+
+MIN_CONFIDENCE = 68
+
+MAX_VIX_FOR_NEW_TRADE = 30.0
+
+MIN_VIX_FOR_CREDIT_SELLING = 10.0
+
+NO_TRADE_COOLDOWN = 300
+
+MARKET_START = dt_time(9, 15)
+
+MARKET_END = dt_time(15, 30)
+
+SQUARE_OFF_TIME = dt_time(15, 15)
+
+
+# ============================================================
+# INDEX CONFIG
+# ============================================================
+
+INDEX_CONFIG = {
+
+    "NIFTY 50": {
+        "ticker": "^NSEI",
+        "vix": "^INDIAVIX",
+        "step": 50,
+        "hedge": 200,
+        "lot_size": 65,
+    },
+
+    "BANKNIFTY": {
+        "ticker": "^NSEBANK",
+        "vix": "^INDIAVIX",
+        "step": 100,
+        "hedge": 400,
+        "lot_size": 30,
+    },
+
+    "SENSEX": {
+        "ticker": "^BSESN",
+        "vix": "^INDIAVIX",
+        "step": 100,
+        "hedge": 500,
+        "lot_size": 20,
+    },
+}
+
+
+# ============================================================
+# DATA CACHE
+# ============================================================
+
+MARKET_CACHE = {}
+
+VIX_CACHE = {}
+
+OPTION_CACHE = {}
+
+
+# ============================================================
+# THREAD LOCK
+# ============================================================
+
+STATE_LOCK = threading.RLock()
+
+
+# ============================================================
+# WEB SERVER
+# ============================================================
+
+@app.route("/")
 def home():
-    return "NSE Smart Hedging Bot Running 24/7!"
+    return (
+        "Advanced Options Selling + "
+        "Mandatory Hedging Engine is running."
+    )
+
+
+@app.route("/health")
+def health():
+    return {
+        "status": "ok",
+        "engine": "advanced-options-selling",
+        "mode": "paper-trading",
+        "time": datetime.now(IST).isoformat()
+    }
+
 
 def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 
-def send_telegram_msg(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    port = int(
+        os.environ.get("PORT", 8080)
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("Telegram token missing.")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("Telegram chat ID missing.")
+        return False
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=8
+        )
+
+        if response.status_code != 200:
+
+            print(
+                "Telegram error:",
+                response.status_code,
+                response.text[:300]
+            )
+
+            return False
+
+        return True
+
+    except Exception as exc:
+
+        print(
+            "Telegram exception:",
+            exc
+        )
+
+        return False
+
+
+# ============================================================
+# MARKET DATA
+# ============================================================
 
 def get_market_data(symbol):
-    ticker_map = {
-        "NIFTY 50": "^NSEI",
-        "BANKNIFTY": "^NSEBANK",
-        "SENSEX": "^BSESN"
-    }
+
+    config = INDEX_CONFIG.get(symbol)
+
+    if not config:
+        return None
+
+    now = time.time()
+
+    cached = MARKET_CACHE.get(symbol)
+
+    if cached:
+
+        df, timestamp = cached
+
+        if now - timestamp < CACHE_SECONDS:
+
+            return df.copy()
+
     try:
-        ticker = yf.Ticker(ticker_map[symbol])
-        df = ticker.history(period="5d", interval="5m")
-        if not df.empty and len(df) >= 20:
-            return df
-    except Exception as e:
-        print(f"Data error for {symbol}: {e}")
+
+        ticker = yf.Ticker(
+            config["ticker"]
+        )
+
+        df = ticker.history(
+            period="5d",
+            interval="5m",
+            auto_adjust=False
+        )
+
+        if (
+            df is not None
+            and not df.empty
+            and len(df) >= 60
+        ):
+
+            df = df.copy()
+
+            df = df.dropna(
+                subset=[
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close"
+                ]
+            )
+
+            MARKET_CACHE[symbol] = (
+                df,
+                now
+            )
+
+            return df.copy()
+
+    except Exception as exc:
+
+        print(
+            f"{symbol} market-data error:",
+            exc
+        )
+
+    if cached:
+
+        print(
+            f"{symbol}: using stale cached data"
+        )
+
+        return cached[0].copy()
+
     return None
 
-def analyze_regime(df):
-    close = df['Close']
-    ema_9 = close.ewm(span=9, adjust=False).mean()
-    ema_21 = close.ewm(span=21, adjust=False).mean()
-    
-    current_close = close.iloc[-1]
-    curr_ema9 = ema_9.iloc[-1]
-    curr_ema21 = ema_21.iloc[-1]
-    
-    recent_high = df['High'].iloc[-12:].max()
-    recent_low = df['Low'].iloc[-12:].min()
-    range_pct = (recent_high - recent_low) / current_close * 100
 
-    if curr_ema9 > curr_ema21 and current_close > curr_ema9 and range_pct > 0.30:
-        return "BULLISH_TREND"
-    elif curr_ema9 < curr_ema21 and current_close < curr_ema9 and range_pct > 0.30:
-        return "BEARISH_TREND"
+# ============================================================
+# INDIA VIX
+# ============================================================
+
+def get_india_vix():
+
+    now = time.time()
+
+    cached = VIX_CACHE.get("INDIA_VIX")
+
+    if cached:
+
+        value, timestamp = cached
+
+        if now - timestamp < CACHE_SECONDS:
+
+            return value
+
+    try:
+
+        ticker = yf.Ticker(
+            "^INDIAVIX"
+        )
+
+        df = ticker.history(
+            period="5d",
+            interval="5m",
+            auto_adjust=False
+        )
+
+        if (
+            df is not None
+            and not df.empty
+        ):
+
+            value = float(
+                df["Close"].iloc[-1]
+            )
+
+            VIX_CACHE["INDIA_VIX"] = (
+                value,
+                now
+            )
+
+            return value
+
+    except Exception as exc:
+
+        print(
+            "India VIX error:",
+            exc
+        )
+
+    if cached:
+        return cached[0]
+
+    return None
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_indicators(df):
+
+    data = df.copy()
+
+    close = data["Close"]
+
+    high = data["High"]
+
+    low = data["Low"]
+
+    volume = (
+        data["Volume"]
+        if "Volume" in data.columns
+        else pd.Series(
+            1,
+            index=data.index
+        )
+    )
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    data["EMA9"] = close.ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    data["EMA21"] = close.ewm(
+        span=21,
+        adjust=False
+    ).mean()
+
+    data["EMA50"] = close.ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    delta = close.diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = gain.ewm(
+        alpha=1 / 14,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / 14,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
+
+    data["RSI"] = (
+        100
+        - (100 / (1 + rs))
+    )
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    ema12 = close.ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema26 = close.ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    data["MACD"] = (
+        ema12 - ema26
+    )
+
+    data["MACD_SIGNAL"] = (
+        data["MACD"]
+        .ewm(
+            span=9,
+            adjust=False
+        )
+        .mean()
+    )
+
+    data["MACD_HIST"] = (
+        data["MACD"]
+        - data["MACD_SIGNAL"]
+    )
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
+
+    previous_close = close.shift(1)
+
+    tr1 = high - low
+
+    tr2 = (
+        high
+        - previous_close
+    ).abs()
+
+    tr3 = (
+        low
+        - previous_close
+    ).abs()
+
+    true_range = pd.concat(
+        [
+            tr1,
+            tr2,
+            tr3
+        ],
+        axis=1
+    ).max(axis=1)
+
+    data["ATR"] = (
+        true_range
+        .ewm(
+            span=14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
+    up_move = high.diff()
+
+    down_move = -low.diff()
+
+    plus_dm = np.where(
+        (up_move > down_move)
+        & (up_move > 0),
+        up_move,
+        0
+    )
+
+    minus_dm = np.where(
+        (down_move > up_move)
+        & (down_move > 0),
+        down_move,
+        0
+    )
+
+    atr14 = (
+        true_range
+        .ewm(
+            span=14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    plus_di = (
+        100
+        * pd.Series(
+            plus_dm,
+            index=data.index
+        ).ewm(
+            span=14,
+            adjust=False
+        ).mean()
+        / atr14.replace(
+            0,
+            np.nan
+        )
+    )
+
+    minus_di = (
+        100
+        * pd.Series(
+            minus_dm,
+            index=data.index
+        ).ewm(
+            span=14,
+            adjust=False
+        ).mean()
+        / atr14.replace(
+            0,
+            np.nan
+        )
+    )
+
+    dx = (
+        100
+        * (plus_di - minus_di).abs()
+        / (plus_di + minus_di).replace(
+            0,
+            np.nan
+        )
+    )
+
+    data["ADX"] = (
+        dx.ewm(
+            span=14,
+            adjust=False
+        ).mean()
+    )
+
+    data["PLUS_DI"] = plus_di
+
+    data["MINUS_DI"] = minus_di
+
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
+
+    typical_price = (
+        high
+        + low
+        + close
+    ) / 3
+
+    cumulative_volume = (
+        volume.cumsum()
+    )
+
+    cumulative_value = (
+        typical_price
+        * volume
+    ).cumsum()
+
+    data["VWAP"] = (
+        cumulative_value
+        / cumulative_volume.replace(
+            0,
+            np.nan
+        )
+    )
+
+    # --------------------------------------------------------
+    # Bollinger Bands
+    # --------------------------------------------------------
+
+    bb_mid = (
+        close
+        .rolling(20)
+        .mean()
+    )
+
+    bb_std = (
+        close
+        .rolling(20)
+        .std()
+    )
+
+    data["BB_MID"] = bb_mid
+
+    data["BB_UPPER"] = (
+        bb_mid
+        + 2 * bb_std
+    )
+
+    data["BB_LOWER"] = (
+        bb_mid
+        - 2 * bb_std
+    )
+
+    data["BB_WIDTH"] = (
+        (
+            data["BB_UPPER"]
+            - data["BB_LOWER"]
+        )
+        / bb_mid
+        * 100
+    )
+
+    # --------------------------------------------------------
+    # Returns / momentum
+    # --------------------------------------------------------
+
+    data["RETURN_5"] = (
+        close.pct_change(5)
+        * 100
+    )
+
+    data["RETURN_15"] = (
+        close.pct_change(15)
+        * 100
+    )
+
+    data["RETURN_30"] = (
+        close.pct_change(30)
+        * 100
+    )
+
+    # --------------------------------------------------------
+    # Volume
+    # --------------------------------------------------------
+
+    data["VOL_AVG"] = (
+        volume
+        .rolling(20)
+        .mean()
+    )
+
+    data["VOLUME_RATIO"] = (
+        volume
+        / data["VOL_AVG"].replace(
+            0,
+            np.nan
+        )
+    )
+
+    # --------------------------------------------------------
+    # Recent range
+    # --------------------------------------------------------
+
+    data["RECENT_HIGH"] = (
+        high
+        .rolling(20)
+        .max()
+    )
+
+    data["RECENT_LOW"] = (
+        low
+        .rolling(20)
+        .min()
+    )
+
+    return data
+
+
+# ============================================================
+# MARKET REGIME + CONFIDENCE
+# ============================================================
+
+def analyze_market(symbol, df):
+
+    data = calculate_indicators(
+        df
+    )
+
+    row = data.iloc[-1]
+
+    spot = float(
+        row["Close"]
+    )
+
+    score = 0
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # TREND
+    # --------------------------------------------------------
+
+    if (
+        row["EMA9"]
+        > row["EMA21"]
+        > row["EMA50"]
+    ):
+
+        score += 20
+
+        reasons.append(
+            "EMA bullish alignment"
+        )
+
+    elif (
+        row["EMA9"]
+        < row["EMA21"]
+        < row["EMA50"]
+    ):
+
+        score -= 20
+
+        reasons.append(
+            "EMA bearish alignment"
+        )
+
     else:
-        return "SIDEWAYS_RANGE"
 
-def estimate_premium(spot, strike, opt_type):
-    distance = abs(spot - strike)
-    base_atm = spot * 0.007
-    if opt_type == "CE":
-        intrinsic = max(0, spot - strike)
-    else:
-        intrinsic = max(0, strike - spot)
-    extrinsic = max(10.0, base_atm - (distance * 0.35))
-    return round(intrinsic + extrinsic, 2)
+        reasons.append(
+            "EMA mixed"
+        )
 
-class RealisticPaperTradingBot:
-    def __init__(self):
-        self.virtual_capital = 200000.0
-        self.starting_capital = 200000.0
-        self.indices = {
-            "NIFTY 50": {"step": 50, "hedge": 200, "lot_size": 25, "active": False, "trade": None},
-            "BANKNIFTY": {"step": 100, "hedge": 400, "lot_size": 15, "active": False, "trade": None},
-            "SENSEX": {"step": 100, "hedge": 500, "lot_size": 10, "active": False, "trade": None}
-        }
-        self.last_update_id = 0
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
 
-    def is_market_open(self):
-        now = datetime.now(IST)
-        if now.weekday() >= 5:
-            return False
-        current_time = now.time()
-        start = datetime.strptime("09:15", "%H:%M").time()
-        end = datetime.strptime("15:30", "%H:%M").time()
-        return start <= current_time <= end
+    if spot > row["VWAP"]:
 
-    def execute_live_order(self, symbol):
-        df = get_market_data(symbol)
-        if df is None:
-            return
+        score += 10
 
-        spot = round(float(df['Close'].iloc[-1]), 2)
-        regime = analyze_regime(df)
-        step = self.indices[symbol]["step"]
-        hedge = self.indices[symbol]["hedge"]
-        lot = self.indices[symbol]["lot_size"]
-        atm_strike = round(spot / step) * step
+        reasons.append(
+            "Above VWAP"
+        )
 
-        trade_info = {
-            "strategy": regime,
-            "entry_spot": spot,
-            "lot_size": lot,
-            "legs": []
-        }
+    elif spot < row["VWAP"]:
 
-        if regime == "BULLISH_TREND":
-            sell_strike = atm_strike
-            buy_strike = atm_strike - hedge
-            sell_prem = estimate_premium(spot, sell_strike, "PE")
-            buy_prem = estimate_premium(spot, buy_strike, "PE")
-            
-            trade_info["legs"].append({"action": "SELL", "strike": sell_strike, "type": "PE", "entry_prem": sell_prem})
-            trade_info["legs"].append({"action": "BUY", "strike": buy_strike, "type": "PE", "entry_prem": buy_prem})
-            strat_name = "Bull Put Credit Spread"
+        score -= 10
 
-        elif regime == "BEARISH_TREND":
-            sell_strike = atm_strike
-            buy_strike = atm_strike + hedge
-            sell_prem = estimate_premium(spot, sell_strike, "CE")
-            buy_prem = estimate_premium(spot, buy_strike, "CE")
-            
-            trade_info["legs"].append({"action": "SELL", "strike": sell_strike, "type": "CE", "entry_prem": sell_prem})
-            trade_info["legs"].append({"action": "BUY", "strike": buy_strike, "type": "CE", "entry_prem": buy_prem})
-            strat_name = "Bear Call Credit Spread"
+        reasons.append(
+            "Below VWAP"
+        )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi = float(
+        row["RSI"]
+    )
+
+    if 52 <= rsi <= 68:
+
+        score += 10
+
+        reasons.append(
+            "Bullish RSI zone"
+        )
+
+    elif 32 <= rsi <= 48:
+
+        score -= 10
+
+        reasons.append(
+            "Bearish RSI zone"
+        )
+
+    elif rsi > 75:
+
+        reasons.append(
+            "RSI overbought"
+        )
+
+    elif rsi < 25:
+
+        reasons.append(
+            "RSI oversold"
+        )
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    if (
+        row["MACD"]
+        > row["MACD_SIGNAL"]
+        and row["MACD_HIST"] > 0
+    ):
+
+        score += 10
+
+        reasons.append(
+            "MACD bullish"
+        )
+
+    elif (
+        row["MACD"]
+        < row["MACD_SIGNAL"]
+        and row["MACD_HIST"] < 0
+    ):
+
+        score -= 10
+
+        reasons.append(
+            "MACD bearish"
+        )
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
+    adx = float(
+        row["ADX"]
+    )
+
+    if adx >= 25:
+
+        if score > 0:
+
+            score += 10
+
+            reasons.append(
+                "Strong bullish trend"
+            )
+
+        elif score < 0:
+
+            score -= 10
+
+            reasons.append(
+                "Strong bearish trend"
+            )
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    if row["RETURN_15"] > 0.20:
+
+        score += 10
+
+        reasons.append(
+            "Positive momentum"
+        )
+
+    elif row["RETURN_15"] < -0.20:
+
+        score -= 10
+
+        reasons.append(
+            "Negative momentum"
+        )
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    if (
+        pd.notna(row["VOLUME_RATIO"])
+        and row["VOLUME_RATIO"] >= 1.20
+    ):
+
+        if score > 0:
+
+            score += 5
+
+            reasons.append(
+                "Volume confirmation"
+            )
+
+        elif score < 0:
+
+            score -= 5
+
+            reasons.append(
+                "Bearish volume confirmation"
+            )
+
+    # --------------------------------------------------------
+    # VIX
+    # --------------------------------------------------------
+
+    vix = get_india_vix()
+
+    if vix is not None:
+
+        if (
+            MIN_VIX_FOR_CREDIT_SELLING
+            <= vix
+            <= MAX_VIX_FOR_NEW_TRADE
+        ):
+
+            reasons.append(
+                f"India VIX {vix:.2f}: acceptable"
+            )
+
+        elif vix > MAX_VIX_FOR_NEW_TRADE:
+
+            reasons.append(
+                f"India VIX {vix:.2f}: high risk"
+            )
 
         else:
-            sell_ce = atm_strike + step
-            buy_ce = atm_strike + step + hedge
-            sell_pe = atm_strike - step
-            buy_pe = atm_strike - step - hedge
 
-            trade_info["legs"].append({"action": "SELL", "strike": sell_ce, "type": "CE", "entry_prem": estimate_premium(spot, sell_ce, "CE")})
-            trade_info["legs"].append({"action": "BUY", "strike": buy_ce, "type": "CE", "entry_prem": estimate_premium(spot, buy_ce, "CE")})
-            trade_info["legs"].append({"action": "SELL", "strike": sell_pe, "type": "PE", "entry_prem": estimate_premium(spot, sell_pe, "PE")})
-            trade_info["legs"].append({"action": "BUY", "strike": buy_pe, "type": "PE", "entry_prem": estimate_premium(spot, buy_pe, "PE")})
-            strat_name = "Hedged Iron Condor"
+            reasons.append(
+                f"India VIX {vix:.2f}: low premium"
+            )
 
-        self.indices[symbol]["active"] = True
-        self.indices[symbol]["trade"] = trade_info
+    # --------------------------------------------------------
+    # CLASSIFICATION
+    # --------------------------------------------------------
 
-        legs_text = ""
-        for leg in trade_info["legs"]:
-            legs_text += f"• {leg['action']} `{leg['strike']} {leg['type']}` @ ₹{leg['entry_prem']}\n"
+    if score >= 35:
 
-        msg = (
-            f"⚡ *[LIVE ORDER EXECUTED]*\n\n"
-            f"🎯 *Index:* `{symbol}` (Qty: {lot})\n"
-            f"📈 *Live Spot:* `₹{spot}`\n"
-            f"📊 *Market Trend:* `{regime}`\n"
-            f"🛡️ *Strategy:* *{strat_name}*\n\n"
-            f"📋 *Order Legs & Premiums:*\n{legs_text}\n"
-            f"💼 *Account Capital:* `₹{self.virtual_capital:,.2f}`\n"
-            f"⏱️ *Time:* `{datetime.now(IST).strftime('%I:%M:%S %p')}`"
+        regime = "STRONG_BULLISH"
+
+    elif score >= 15:
+
+        regime = "MILD_BULLISH"
+
+    elif score <= -35:
+
+        regime = "STRONG_BEARISH"
+
+    elif score <= -15:
+
+        regime = "MILD_BEARISH"
+
+    else:
+
+        regime = "NEUTRAL_RANGE"
+
+    confidence = min(
+        95,
+        50 + abs(score)
+    )
+
+    return {
+        "spot": spot,
+        "score": score,
+        "confidence": confidence,
+        "regime": regime,
+        "vix": vix,
+        "adx": adx,
+        "rsi": rsi,
+        "atr": float(row["ATR"]),
+        "vwap": float(row["VWAP"]),
+        "bb_width": float(
+            row["BB_WIDTH"]
+        ),
+        "reasons": reasons,
+    }
+
+
+# ============================================================
+# NSE OPTION CHAIN
+#
+# This is OPTIONAL.
+# If NSE blocks the request or data is unavailable,
+# the engine DOES NOT invent option premiums.
+# ============================================================
+
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/153.0 Safari/537.36"
+    ),
+    "Accept": (
+        "application/json,text/plain,*/*"
+    ),
+    "Accept-Language": (
+        "en-US,en;q=0.9"
+    ),
+    "Referer": (
+        "https://www.nseindia.com/"
+    ),
+}
+
+
+def get_nse_option_chain(symbol):
+
+    # SENSEX is not on NSE.
+    if symbol == "SENSEX":
+        return None
+
+    nse_symbol = {
+        "NIFTY 50": "NIFTY",
+        "BANKNIFTY": "BANKNIFTY",
+    }.get(symbol)
+
+    if not nse_symbol:
+        return None
+
+    now = time.time()
+
+    cached = OPTION_CACHE.get(symbol)
+
+    if cached:
+
+        chain, timestamp = cached
+
+        if now - timestamp < 30:
+
+            return chain
+
+    session = requests.Session()
+
+    try:
+
+        session.headers.update(
+            NSE_HEADERS
         )
-        send_telegram_msg(msg)
 
-    def calculate_trade_pnl(self, symbol, current_spot):
-        trade = self.indices[symbol]["trade"]
-        if not trade:
-            return 0.0
-        
-        total_pnl = 0.0
-        lot = trade["lot_size"]
+        # Warm-up NSE session.
+        session.get(
+            "https://www.nseindia.com/",
+            timeout=8
+        )
 
-        for leg in trade["legs"]:
-            curr_prem = estimate_premium(current_spot, leg["strike"], leg["type"])
-            if leg["action"] == "SELL":
-                pnl = (leg["entry_prem"] - curr_prem) * lot
-            else:
-                pnl = (curr_prem - leg["entry_prem"]) * lot
-            total_pnl += pnl
+        url = (
+            "https://www.nseindia.com/"
+            "api/option-chain-indices"
+        )
 
-        return round(total_pnl, 2)
+        response = session.get(
+            url,
+            params={
+                "symbol": nse_symbol
+            },
+            timeout=10
+        )
 
-    def get_status_summary(self):
-        has_trades = False
-        net_running_pnl = 0.0
-        msg = "📊 *[LIVE STATUS & P&L REPORT]*\n\n"
+        if response.status_code != 200:
 
-        for sym, d in self.indices.items():
-            if d["active"] and d["trade"] is not None:
-                has_trades = True
-                df = get_market_data(sym)
-                curr_spot = round(float(df['Close'].iloc[-1]), 2) if df is not None else d["trade"]["entry_spot"]
-                pnl = self.calculate_trade_pnl(sym, curr_spot)
-                net_running_pnl += pnl
-                status_emoji = "🟢" if pnl >= 0 else "🔴"
-                msg += (
-                    f"• `{sym}` ({d['trade']['strategy']})\n"
-                    f"  Spot: ₹{curr_spot} | P&L: {status_emoji} *₹{pnl:+,.2f}*\n\n"
+            print(
+                f"{symbol}: NSE option chain "
+                f"HTTP {response.status_code}"
+            )
+
+            return None
+
+        payload = response.json()
+
+        records = payload.get(
+            "records",
+            {}
+        )
+
+        data = records.get(
+            "data",
+            []
+        )
+
+        if not data:
+
+            return None
+
+        OPTION_CACHE[symbol] = (
+            payload,
+            now
+        )
+
+        return payload
+
+    except Exception as exc:
+
+        print(
+            f"{symbol}: option-chain error:",
+            exc
+        )
+
+        return None
+
+
+# ============================================================
+# OPTION CHAIN ANALYSIS
+# ============================================================
+
+def analyze_option_chain(
+    symbol,
+    spot
+):
+
+    payload = get_nse_option_chain(
+        symbol
+    )
+
+    if not payload:
+
+        return {
+            "available": False,
+            "pcr": None,
+            "call_oi": None,
+            "put_oi": None,
+            "call_change_oi": None,
+            "put_change_oi": None,
+        }
+
+    try:
+
+        records = payload[
+            "records"
+        ]
+
+        rows = records[
+            "data"
+        ]
+
+        expiry_list = records.get(
+            "expiryDates",
+            []
+        )
+
+        if not expiry_list:
+
+            return {
+                "available": False
+            }
+
+        nearest_expiry = expiry_list[0]
+
+        filtered = [
+            row
+            for row in rows
+            if row.get("expiryDate")
+            == nearest_expiry
+        ]
+
+        # Keep a reasonable zone around spot.
+        filtered = [
+            row
+            for row in filtered
+            if abs(
+                float(
+                    row["strikePrice"]
+                )
+                - spot
+            )
+            <= max(
+                1000,
+                spot * 0.05
+            )
+        ]
+
+        call_oi = 0.0
+
+        put_oi = 0.0
+
+        call_change = 0.0
+
+        put_change = 0.0
+
+        for row in filtered:
+
+            ce = row.get(
+                "CE"
+            )
+
+            pe = row.get(
+                "PE"
+            )
+
+            if ce:
+
+                call_oi += float(
+                    ce.get(
+                        "openInterest",
+                        0
+                    )
                 )
 
-        if not has_trades:
-            return "ℹ️ Atyare koi active open position nathi. Market open ma bot trade execute karshe."
+                call_change += float(
+                    ce.get(
+                        "changeinOpenInterest",
+                        0
+                    )
+                )
 
-        net_status = "🟢 PROFIT" if net_running_pnl >= 0 else "🔴 LOSS"
-        msg += (
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 *Net Running P&L:* {net_status} `₹{net_running_pnl:+,.2f}`\n"
-            f"💼 *Virtual Balance:* `₹{(self.virtual_capital + net_running_pnl):,.2f}`"
+            if pe:
+
+                put_oi += float(
+                    pe.get(
+                        "openInterest",
+                        0
+                    )
+                )
+
+                put_change += float(
+                    pe.get(
+                        "changeinOpenInterest",
+                        0
+                    )
+                )
+
+        pcr = (
+            put_oi / call_oi
+            if call_oi > 0
+            else None
         )
-        return msg
 
-    def close_all_trades(self):
-        day_pnl = 0.0
-        msg = "🛑 *[INTRADAY SQUARE-OFF (03:15 PM)]*\n\n"
-        has_trades = False
+        return {
+            "available": True,
+            "expiry": nearest_expiry,
+            "pcr": pcr,
+            "call_oi": call_oi,
+            "put_oi": put_oi,
+            "call_change_oi": call_change,
+            "put_change_oi": put_change,
+        }
 
-        for sym, d in self.indices.items():
-            if d["active"] and d["trade"] is not None:
-                has_trades = True
-                df = get_market_data(sym)
-                curr_spot = round(float(df['Close'].iloc[-1]), 2) if df is not None else d["trade"]["entry_spot"]
-                pnl = self.calculate_trade_pnl(sym, curr_spot)
-                day_pnl += pnl
-                d["active"] = False
-                d["trade"] = None
-                status_emoji = "🟢" if pnl >= 0 else "🔴"
-                msg += f"• `{sym}` Closed | P&L: {status_emoji} *₹{pnl:+,.2f}*\n"
+    except Exception as exc:
 
-        if has_trades:
-            self.virtual_capital += day_pnl
-            net_status = "🟢 NET PROFIT" if day_pnl >= 0 else "🔴 NET LOSS"
-            msg += (
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"🏁 *Day Summary:* {net_status} `₹{day_pnl:+,.2f}`\n"
-                f"💰 *Updated Total Capital:* `₹{self.virtual_capital:,.2f}`\n"
-                f"📈 *ROI:* `{(self.virtual_capital - self.starting_capital) / self.starting_capital * 100:+.2f}%`"
+        print(
+            f"{symbol}: option-chain parse error:",
+            exc
+        )
+
+        return {
+            "available": False
+        }
+
+
+# ============================================================
+# STRATEGY SELECTOR
+# ============================================================
+
+def choose_strategy(
+    analysis,
+    option_data
+):
+
+    regime = analysis["regime"]
+
+    confidence = analysis["confidence"]
+
+    vix = analysis["vix"]
+
+    # --------------------------------------------------------
+    # HARD SAFETY FILTERS
+    # --------------------------------------------------------
+
+    if confidence < MIN_CONFIDENCE:
+
+        return (
+            "NO_TRADE",
+            "Confidence below threshold"
+        )
+
+    if vix is not None:
+
+        if vix > MAX_VIX_FOR_NEW_TRADE:
+
+            return (
+                "NO_TRADE",
+                "India VIX too high"
             )
-            send_telegram_msg(msg)
 
-    def check_telegram_commands(self):
-        if not TELEGRAM_BOT_TOKEN:
+        if vix < MIN_VIX_FOR_CREDIT_SELLING:
+
+            return (
+                "NO_TRADE",
+                "Premium environment too weak"
+            )
+
+    # --------------------------------------------------------
+    # OPTION CHAIN SENTIMENT
+    # --------------------------------------------------------
+
+    pcr = option_data.get(
+        "pcr"
+    )
+
+    # --------------------------------------------------------
+    # STRONG BULLISH
+    # --------------------------------------------------------
+
+    if regime == "STRONG_BULLISH":
+
+        if (
+            pcr is not None
+            and pcr < 0.65
+        ):
+
+            return (
+                "NO_TRADE",
+                "Price bullish but option sentiment weak"
+            )
+
+        return (
+            "BULL_PUT_SPREAD",
+            "Bullish trend supports put credit spread"
+        )
+
+    # --------------------------------------------------------
+    # MILD BULLISH
+    # --------------------------------------------------------
+
+    if regime == "MILD_BULLISH":
+
+        return (
+            "BULL_PUT_SPREAD",
+            "Moderate bullish bias"
+        )
+
+    # --------------------------------------------------------
+    # STRONG BEARISH
+    # --------------------------------------------------------
+
+    if regime == "STRONG_BEARISH":
+
+        if (
+            pcr is not None
+            and pcr > 1.50
+        ):
+
+            return (
+                "NO_TRADE",
+                "Bearish price action but put-heavy sentiment"
+            )
+
+        return (
+            "BEAR_CALL_SPREAD",
+            "Bearish trend supports call credit spread"
+        )
+
+    # --------------------------------------------------------
+    # MILD BEARISH
+    # --------------------------------------------------------
+
+    if regime == "MILD_BEARISH":
+
+        return (
+            "BEAR_CALL_SPREAD",
+            "Moderate bearish bias"
+        )
+
+    # --------------------------------------------------------
+    # RANGE
+    # --------------------------------------------------------
+
+    if regime == "NEUTRAL_RANGE":
+
+        if (
+            vix is not None
+            and vix >= 13
+        ):
+
+            return (
+                "IRON_CONDOR",
+                "Range regime with usable volatility"
+            )
+
+        return (
+            "NO_TRADE",
+            "Range but insufficient premium"
+        )
+
+    return (
+        "NO_TRADE",
+        "No valid strategy"
+    )
+
+
+# ============================================================
+# PAPER OPTION PREMIUM
+#
+# IMPORTANT:
+# This is ONLY a fallback simulation model.
+# It is NOT claimed to be live market premium.
+# The engine marks the source as MODELLED.
+# ============================================================
+
+def model_option_premium(
+    spot,
+    strike,
+    option_type,
+    vix,
+    days_to_expiry=3
+):
+
+    if spot <= 0:
+        return None
+
+    if vix is None:
+        vix = 15.0
+
+    t = max(
+        days_to_expiry / 365,
+        1 / 365
+    )
+
+    sigma = max(
+        vix / 100,
+        0.08
+    )
+
+    r = 0.06
+
+    try:
+
+        d1 = (
+            math.log(
+                spot / strike
+            )
+            + (
+                r
+                + sigma ** 2 / 2
+            ) * t
+        ) / (
+            sigma
+            * math.sqrt(t)
+        )
+
+        d2 = (
+            d1
+            - sigma
+            * math.sqrt(t)
+        )
+
+        # Normal CDF without scipy.
+        def norm_cdf(x):
+
+            return (
+                0.5
+                * (
+                    1
+                    + math.erf(
+                        x / math.sqrt(2)
+                    )
+                )
+            )
+
+        if option_type == "CE":
+
+            premium = (
+                spot
+                * norm_cdf(d1)
+                - strike
+                * math.exp(-r * t)
+                * norm_cdf(d2)
+            )
+
+        else:
+
+            premium = (
+                strike
+                * math.exp(-r * t)
+                * norm_cdf(-d2)
+                - spot
+                * norm_cdf(-d1)
+            )
+
+        return round(
+            max(
+                premium,
+                0.05
+            ),
+            2
+        )
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# BUILD HEDGED STRATEGY
+# ============================================================
+
+def build_strategy(
+    symbol,
+    analysis,
+    strategy
+):
+
+    spot = analysis["spot"]
+
+    vix = analysis["vix"]
+
+    config = INDEX_CONFIG[symbol]
+
+    step = config["step"]
+
+    hedge = config["hedge"]
+
+    lot = config["lot_size"]
+
+    atm = (
+        round(
+            spot / step
+        )
+        * step
+    )
+
+    legs = []
+
+    # --------------------------------------------------------
+    # BULL PUT CREDIT SPREAD
+    # --------------------------------------------------------
+
+    if strategy == "BULL_PUT_SPREAD":
+
+        sell_strike = (
+            atm
+            - step
+        )
+
+        buy_strike = (
+            sell_strike
+            - hedge
+        )
+
+        sell_premium = model_option_premium(
+            spot,
+            sell_strike,
+            "PE",
+            vix
+        )
+
+        buy_premium = model_option_premium(
+            spot,
+            buy_strike,
+            "PE",
+            vix
+        )
+
+        if (
+            sell_premium is None
+            or buy_premium is None
+        ):
+
+            return None
+
+        legs = [
+
+            {
+                "action": "SELL",
+                "type": "PE",
+                "strike": sell_strike,
+                "premium": sell_premium
+            },
+
+            {
+                "action": "BUY",
+                "type": "PE",
+                "strike": buy_strike,
+                "premium": buy_premium
+            }
+        ]
+
+        name = (
+            "Bull Put Credit Spread"
+        )
+
+    # --------------------------------------------------------
+    # BEAR CALL CREDIT SPREAD
+    # --------------------------------------------------------
+
+    elif strategy == "BEAR_CALL_SPREAD":
+
+        sell_strike = (
+            atm
+            + step
+        )
+
+        buy_strike = (
+            sell_strike
+            + hedge
+        )
+
+        sell_premium = model_option_premium(
+            spot,
+            sell_strike,
+            "CE",
+            vix
+        )
+
+        buy_premium = model_option_premium(
+            spot,
+            buy_strike,
+            "CE",
+            vix
+        )
+
+        if (
+            sell_premium is None
+            or buy_premium is None
+        ):
+
+            return None
+
+        legs = [
+
+            {
+                "action": "SELL",
+                "type": "CE",
+                "strike": sell_strike,
+                "premium": sell_premium
+            },
+
+            {
+                "action": "BUY",
+                "type": "CE",
+                "strike": buy_strike,
+                "premium": buy_premium
+            }
+        ]
+
+        name = (
+            "Bear Call Credit Spread"
+        )
+
+    # --------------------------------------------------------
+    # IRON CONDOR
+    # --------------------------------------------------------
+
+    elif strategy == "IRON_CONDOR":
+
+        sell_ce = (
+            atm
+            + step
+        )
+
+        buy_ce = (
+            sell_ce
+            + hedge
+        )
+
+        sell_pe = (
+            atm
+            - step
+        )
+
+        buy_pe = (
+            sell_pe
+            - hedge
+        )
+
+        sell_ce_premium = model_option_premium(
+            spot,
+            sell_ce,
+            "CE",
+            vix
+        )
+
+        buy_ce_premium = model_option_premium(
+            spot,
+            buy_ce,
+            "CE",
+            vix
+        )
+
+        sell_pe_premium = model_option_premium(
+            spot,
+            sell_pe,
+            "PE",
+            vix
+        )
+
+        buy_pe_premium = model_option_premium(
+            spot,
+            buy_pe,
+            "PE",
+            vix
+        )
+
+        if any(
+            x is None
+            for x in [
+                sell_ce_premium,
+                buy_ce_premium,
+                sell_pe_premium,
+                buy_pe_premium
+            ]
+        ):
+
+            return None
+
+        legs = [
+
+            {
+                "action": "SELL",
+                "type": "CE",
+                "strike": sell_ce,
+                "premium": sell_ce_premium
+            },
+
+            {
+                "action": "BUY",
+                "type": "CE",
+                "strike": buy_ce,
+                "premium": buy_ce_premium
+            },
+
+            {
+                "action": "SELL",
+                "type": "PE",
+                "strike": sell_pe,
+                "premium": sell_pe_premium
+            },
+
+            {
+                "action": "BUY",
+                "type": "PE",
+                "strike": buy_pe,
+                "premium": buy_pe_premium
+            }
+        ]
+
+        name = (
+            "Hedged Iron Condor"
+        )
+
+    else:
+
+        return None
+
+    # --------------------------------------------------------
+    # CREDIT / MAX RISK
+    # --------------------------------------------------------
+
+    credit = 0.0
+
+    for leg in legs:
+
+        if leg["action"] == "SELL":
+
+            credit += leg["premium"]
+
+        else:
+
+            credit -= leg["premium"]
+
+    if strategy == "IRON_CONDOR":
+
+        wing_width = hedge
+
+        max_loss_points = (
+            wing_width
+            - credit
+        )
+
+    else:
+
+        wing_width = hedge
+
+        max_loss_points = (
+            wing_width
+            - credit
+        )
+
+    max_loss = (
+        max_loss_points
+        * lot
+    )
+
+    max_credit = (
+        credit
+        * lot
+    )
+
+    return {
+
+        "strategy": strategy,
+
+        "name": name,
+
+        "spot": spot,
+
+        "atm": atm,
+
+        "lot_size": lot,
+
+        "legs": legs,
+
+        "credit_points": round(
+            credit,
+            2
+        ),
+
+        "max_profit": round(
+            max_credit,
+            2
+        ),
+
+        "max_loss": round(
+            max_loss,
+            2
+        ),
+
+        "risk_reward": (
+            round(
+                max_credit / max_loss,
+                2
+            )
+            if max_loss > 0
+            else 0
+        ),
+
+        "premium_source": "MODELLED"
+    }
+
+
+# ============================================================
+# P&L
+# ============================================================
+
+def calculate_strategy_pnl(
+    trade,
+    current_spot,
+    vix
+):
+
+    total = 0.0
+
+    lot = trade["lot_size"]
+
+    for leg in trade["legs"]:
+
+        current_premium = model_option_premium(
+            current_spot,
+            leg["strike"],
+            leg["type"],
+            vix
+        )
+
+        if current_premium is None:
+            continue
+
+        entry = leg["premium"]
+
+        if leg["action"] == "SELL":
+
+            pnl = (
+                entry
+                - current_premium
+            ) * lot
+
+        else:
+
+            pnl = (
+                current_premium
+                - entry
+            ) * lot
+
+        total += pnl
+
+    return round(
+        total,
+        2
+    )
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+class AdvancedHedgingBot:
+
+    def __init__(self):
+
+        self.virtual_capital = (
+            STARTING_CAPITAL
+        )
+
+        self.starting_capital = (
+            STARTING_CAPITAL
+        )
+
+        self.daily_realized_pnl = 0.0
+
+        self.consecutive_losses = 0
+
+        self.last_update_id = 0
+
+        self.last_trade_time = {}
+
+        self.last_status_time = time.time()
+
+        self.squared_off_today = False
+
+        self.trade_date = (
+            datetime.now(IST).date()
+        )
+
+        self.positions = {}
+
+        for symbol in INDEX_CONFIG:
+
+            self.positions[symbol] = {
+                "active": False,
+                "trade": None
+            }
+
+
+    # ========================================================
+    # MARKET OPEN
+    # ========================================================
+
+    def is_market_open(self):
+
+        now = datetime.now(IST)
+
+        if now.weekday() >= 5:
+
+            return False
+
+        current = now.time()
+
+        return (
+            MARKET_START
+            <= current
+            <= MARKET_END
+        )
+
+
+    # ========================================================
+    # DAILY RESET
+    # ========================================================
+
+    def reset_new_day(self):
+
+        today = (
+            datetime.now(IST).date()
+        )
+
+        if today == self.trade_date:
+
             return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        params = {"offset": self.last_update_id + 1, "timeout": 1}
-        try:
-            res = requests.get(url, params=params, timeout=5).json()
-            if "result" in res:
-                for update in res["result"]:
-                    self.last_update_id = update["update_id"]
-                    if "message" in update and "text" in update["message"]:
-                        text = update["message"]["text"].strip().lower()
-                        chat_id = str(update["message"]["chat"]["id"])
-                        if chat_id == str(TELEGRAM_CHAT_ID):
-                            if text in ["/status", "status"]:
-                                send_telegram_msg(self.get_status_summary())
-        except Exception:
-            pass
 
-    def run_loop(self):
-        time.sleep(3)
-        send_telegram_msg("🚀 *NSE Dynamic Hedging Bot Active with 15-Min Live P&L Updates!*")
+        with STATE_LOCK:
 
-        last_pnl_check = time.time()
-        squared_off_today = False
+            self.trade_date = today
+
+            self.daily_realized_pnl = 0.0
+
+            self.consecutive_losses = 0
+
+            self.squared_off_today = False
+
+            for symbol in self.positions:
+
+                self.positions[symbol] = {
+                    "active": False,
+                    "trade": None
+                }
+
+        send_telegram(
+            "🌅 *NEW TRADING DAY*\n\n"
+            f"📅 `{today.strftime('%d-%m-%Y')}`\n"
+            "🛡️ Hedging engine ready.\n"
+            "📊 Paper trading mode."
+        )
+
+
+    # ========================================================
+    # RISK CHECK
+    # ========================================================
+
+    def risk_allows_new_trade(
+        self,
+        symbol
+    ):
+
+        if (
+            self.daily_realized_pnl
+            <= -MAX_DAILY_LOSS
+        ):
+
+            return False, (
+                "Daily loss limit reached"
+            )
+
+        if self.consecutive_losses >= 3:
+
+            return False, (
+                "Three consecutive losses"
+            )
+
+        last = self.last_trade_time.get(
+            symbol
+        )
+
+        if last:
+
+            if (
+                time.time()
+                - last
+                < NO_TRADE_COOLDOWN
+            ):
+
+                return False, (
+                    "Cooldown active"
+                )
+
+        return True, "OK"
+
+
+    # ========================================================
+    # EXECUTE PAPER STRATEGY
+    # ========================================================
+
+    def evaluate_symbol(
+        self,
+        symbol
+    ):
+
+        if self.positions[symbol]["active"]:
+
+            return
+
+        allowed, reason = (
+            self.risk_allows_new_trade(
+                symbol
+            )
+        )
+
+        if not allowed:
+
+            print(
+                f"{symbol}: NO TRADE - {reason}"
+            )
+
+            return
+
+        df = get_market_data(
+            symbol
+        )
+
+        if df is None:
+
+            print(
+                f"{symbol}: no market data"
+            )
+
+            return
+
+        analysis = analyze_market(
+            symbol,
+            df
+        )
+
+        option_data = (
+            analyze_option_chain(
+                symbol,
+                analysis["spot"]
+            )
+        )
+
+        strategy, strategy_reason = (
+            choose_strategy(
+                analysis,
+                option_data
+            )
+        )
+
+        # ----------------------------------------------------
+        # NO TRADE
+        # ----------------------------------------------------
+
+        if strategy == "NO_TRADE":
+
+            print(
+                f"{symbol}: NO TRADE - "
+                f"{strategy_reason}"
+            )
+
+            return
+
+        trade = build_strategy(
+            symbol,
+            analysis,
+            strategy
+        )
+
+        if trade is None:
+
+            print(
+                f"{symbol}: strategy build failed"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # SAFETY: CREDIT MUST BE POSITIVE
+        # ----------------------------------------------------
+
+        if trade["credit_points"] <= 0:
+
+            print(
+                f"{symbol}: NO TRADE - "
+                "negative credit"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # SAFETY: MAX LOSS
+        # ----------------------------------------------------
+
+        if (
+            trade["max_loss"]
+            > self.virtual_capital
+            * 0.10
+        ):
+
+            print(
+                f"{symbol}: NO TRADE - "
+                "risk too large"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------
+
+        trade["entry_time"] = (
+            datetime.now(IST)
+        )
+
+        trade["regime"] = (
+            analysis["regime"]
+        )
+
+        trade["confidence"] = (
+            analysis["confidence"]
+        )
+
+        trade["vix"] = (
+            analysis["vix"]
+        )
+
+        trade["rsi"] = (
+            analysis["rsi"]
+        )
+
+        trade["adx"] = (
+            analysis["adx"]
+        )
+
+        trade["pcr"] = (
+            option_data.get("pcr")
+        )
+
+        with STATE_LOCK:
+
+            self.positions[symbol] = {
+                "active": True,
+                "trade": trade
+            }
+
+            self.last_trade_time[symbol] = (
+                time.time()
+            )
+
+        # ----------------------------------------------------
+        # TELEGRAM MESSAGE
+        # ----------------------------------------------------
+
+        legs_text = ""
+
+        for leg in trade["legs"]:
+
+            legs_text += (
+                f"• {leg['action']} "
+                f"`{leg['strike']} "
+                f"{leg['type']}` "
+                f"@ ₹{leg['premium']:.2f}\n"
+            )
+
+        pcr_text = (
+            f"{trade['pcr']:.2f}"
+            if trade["pcr"] is not None
+            else "N/A"
+        )
+
+        vix_text = (
+            f"{trade['vix']:.2f}"
+            if trade["vix"] is not None
+            else "N/A"
+        )
+
+        message = (
+            "🛡️ *[HEDGED OPTION-SELLING SIGNAL]*\n\n"
+            f"🎯 *Index:* `{symbol}`\n"
+            f"📈 *Spot:* `₹{trade['spot']:.2f}`\n"
+            f"📊 *Regime:* `{trade['regime']}`\n"
+            f"🧠 *Confidence:* `{trade['confidence']}%`\n"
+            f"🌡️ *India VIX:* `{vix_text}`\n"
+            f"📉 *RSI:* `{trade['rsi']:.1f}`\n"
+            f"💪 *ADX:* `{trade['adx']:.1f}`\n"
+            f"📊 *PCR:* `{pcr_text}`\n\n"
+            f"🛡️ *Strategy:* "
+            f"*{trade['name']}*\n\n"
+            f"📋 *Hedged Legs:*\n"
+            f"{legs_text}\n"
+            f"💰 *Credit:* "
+            f"`₹{trade['max_profit']:,.2f}`\n"
+            f"⚠️ *Max Model Risk:* "
+            f"`₹{trade['max_loss']:,.2f}`\n"
+            f"📐 *R:R:* "
+            f"`{trade['risk_reward']}`\n\n"
+            "⚠️ *Mode:* PAPER TRADING\n"
+            "⚠️ Premium source: MODELLED\n"
+            f"⏱️ `{datetime.now(IST).strftime('%I:%M:%S %p')}`"
+        )
+
+        send_telegram(
+            message
+        )
+
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def get_status(self):
+
+        lines = [
+            "📊 *ADVANCED HEDGING STATUS*",
+            ""
+        ]
+
+        active_count = 0
+
+        running_pnl = 0.0
+
+        for symbol in INDEX_CONFIG:
+
+            position = (
+                self.positions[symbol]
+            )
+
+            if not position["active"]:
+
+                lines.append(
+                    f"• `{symbol}`: NO POSITION"
+                )
+
+                continue
+
+            active_count += 1
+
+            trade = position["trade"]
+
+            df = get_market_data(
+                symbol
+            )
+
+            if df is not None:
+
+                current_spot = float(
+                    df["Close"].iloc[-1]
+                )
+
+            else:
+
+                current_spot = (
+                    trade["spot"]
+                )
+
+            vix = get_india_vix()
+
+            pnl = calculate_strategy_pnl(
+                trade,
+                current_spot,
+                vix
+            )
+
+            running_pnl += pnl
+
+            emoji = (
+                "🟢"
+                if pnl >= 0
+                else "🔴"
+            )
+
+            lines.append(
+                f"• `{symbol}`\n"
+                f"  Spot: ₹{current_spot:,.2f}\n"
+                f"  Strategy: "
+                f"`{trade['name']}`\n"
+                f"  Confidence: "
+                f"`{trade['confidence']}%`\n"
+                f"  P&L: {emoji} "
+                f"*₹{pnl:+,.2f}*"
+            )
+
+            lines.append("")
+
+        if active_count == 0:
+
+            lines.append(
+                "ℹ️ No active hedged positions."
+            )
+
+        lines.extend([
+            "━━━━━━━━━━━━━━━━━━",
+            f"💵 *Running P&L:* "
+            f"`₹{running_pnl:+,.2f}`",
+            f"💰 *Virtual Capital:* "
+            f"`₹{self.virtual_capital + running_pnl:,.2f}`",
+            f"📉 *Today's Realized P&L:* "
+            f"`₹{self.daily_realized_pnl:+,.2f}`",
+            f"🛡️ *Daily Loss Limit:* "
+            f"`₹{MAX_DAILY_LOSS:,.2f}`",
+            "⚠️ *Paper Trading Only*"
+        ])
+
+        return "\n".join(
+            lines
+        )
+
+
+    # ========================================================
+    # SIGNAL DETAILS
+    # ========================================================
+
+    def get_signal_report(
+        self,
+        symbol
+    ):
+
+        if symbol not in INDEX_CONFIG:
+
+            return (
+                "Unknown symbol.\n"
+                "Use: NIFTY, BANKNIFTY or SENSEX"
+            )
+
+        df = get_market_data(
+            symbol
+        )
+
+        if df is None:
+
+            return (
+                f"❌ `{symbol}` market data unavailable."
+            )
+
+        analysis = analyze_market(
+            symbol,
+            df
+        )
+
+        option_data = (
+            analyze_option_chain(
+                symbol,
+                analysis["spot"]
+            )
+        )
+
+        strategy, reason = (
+            choose_strategy(
+                analysis,
+                option_data
+            )
+        )
+
+        vix_text = (
+            f"{analysis['vix']:.2f}"
+            if analysis["vix"] is not None
+            else "N/A"
+        )
+
+        pcr_text = (
+            f"{option_data['pcr']:.2f}"
+            if option_data.get("pcr") is not None
+            else "N/A"
+        )
+
+        reasons = "\n".join(
+            f"• {x}"
+            for x in analysis["reasons"][:10]
+        )
+
+        return (
+            "🔎 *SIGNAL ANALYSIS*\n\n"
+            f"🎯 Index: `{symbol}`\n"
+            f"📈 Spot: `₹{analysis['spot']:,.2f}`\n"
+            f"📊 Regime: "
+            f"`{analysis['regime']}`\n"
+            f"🧠 Confidence: "
+            f"`{analysis['confidence']}%`\n"
+            f"🌡️ India VIX: `{vix_text}`\n"
+            f"📉 RSI: `{analysis['rsi']:.1f}`\n"
+            f"💪 ADX: `{analysis['adx']:.1f}`\n"
+            f"📊 PCR: `{pcr_text}`\n\n"
+            f"🛡️ *Suggested Strategy:* "
+            f"`{strategy}`\n"
+            f"ℹ️ Reason: {reason}\n\n"
+            "*Signal Factors:*\n"
+            f"{reasons}\n\n"
+            "⚠️ Paper-trading analysis."
+        )
+
+
+    # ========================================================
+    # RISK REPORT
+    # ========================================================
+
+    def get_risk_report(self):
+
+        current_running = 0.0
+
+        for symbol in INDEX_CONFIG:
+
+            position = (
+                self.positions[symbol]
+            )
+
+            if not position["active"]:
+
+                continue
+
+            trade = position["trade"]
+
+            df = get_market_data(
+                symbol
+            )
+
+            if df is None:
+
+                continue
+
+            spot = float(
+                df["Close"].iloc[-1]
+            )
+
+            current_running += (
+                calculate_strategy_pnl(
+                    trade,
+                    spot,
+                    get_india_vix()
+                )
+            )
+
+        remaining_loss = max(
+            0,
+            MAX_DAILY_LOSS
+            + self.daily_realized_pnl
+        )
+
+        return (
+            "🛡️ *RISK REPORT*\n\n"
+            f"💰 Capital: "
+            f"`₹{self.virtual_capital:,.2f}`\n"
+            f"📊 Running P&L: "
+            f"`₹{current_running:+,.2f}`\n"
+            f"📉 Realized Today: "
+            f"`₹{self.daily_realized_pnl:+,.2f}`\n"
+            f"🚨 Daily Loss Limit: "
+            f"`₹{MAX_DAILY_LOSS:,.2f}`\n"
+            f"🟢 Remaining Loss Capacity: "
+            f"`₹{remaining_loss:,.2f}`\n"
+            f"🔴 Consecutive Losses: "
+            f"`{self.consecutive_losses}`\n\n"
+            "🛡️ Mandatory hedging: ON\n"
+            "🚫 Naked selling: OFF\n"
+            "⚠️ Paper trading: ON"
+        )
+
+
+    # ========================================================
+    # CLOSE ALL
+    # ========================================================
+
+    def close_all_positions(self):
+
+        total_day_pnl = 0.0
+
+        report = [
+            "🛑 *INTRADAY HEDGED SQUARE-OFF*",
+            ""
+        ]
+
+        closed_any = False
+
+        for symbol in INDEX_CONFIG:
+
+            position = (
+                self.positions[symbol]
+            )
+
+            if not position["active"]:
+
+                continue
+
+            closed_any = True
+
+            trade = position["trade"]
+
+            df = get_market_data(
+                symbol
+            )
+
+            if df is not None:
+
+                spot = float(
+                    df["Close"].iloc[-1]
+                )
+
+            else:
+
+                spot = trade["spot"]
+
+            pnl = calculate_strategy_pnl(
+                trade,
+                spot,
+                get_india_vix()
+            )
+
+            total_day_pnl += pnl
+
+            emoji = (
+                "🟢"
+                if pnl >= 0
+                else "🔴"
+            )
+
+            report.append(
+                f"• `{symbol}` "
+                f"{emoji} "
+                f"`₹{pnl:+,.2f}`"
+            )
+
+            if pnl < 0:
+
+                self.consecutive_losses += 1
+
+            else:
+
+                self.consecutive_losses = 0
+
+            with STATE_LOCK:
+
+                self.positions[symbol] = {
+                    "active": False,
+                    "trade": None
+                }
+
+        if not closed_any:
+
+            return
+
+        self.virtual_capital += (
+            total_day_pnl
+        )
+
+        self.daily_realized_pnl += (
+            total_day_pnl
+        )
+
+        roi = (
+            (
+                self.virtual_capital
+                - self.starting_capital
+            )
+            / self.starting_capital
+            * 100
+        )
+
+        status = (
+            "🟢 PROFIT"
+            if total_day_pnl >= 0
+            else "🔴 LOSS"
+        )
+
+        report.extend([
+            "",
+            "━━━━━━━━━━━━━━━━━━",
+            f"🏁 Day P&L: "
+            f"{status} "
+            f"`₹{total_day_pnl:+,.2f}`",
+            f"💰 Capital: "
+            f"`₹{self.virtual_capital:,.2f}`",
+            f"📈 Overall ROI: "
+            f"`{roi:+.2f}%`",
+            "⚠️ Paper trading."
+        ])
+
+        send_telegram(
+            "\n".join(report)
+        )
+
+
+    # ========================================================
+    # TELEGRAM COMMAND LISTENER
+    # ========================================================
+
+    def telegram_listener(self):
+
+        print(
+            "Telegram listener started."
+        )
 
         while True:
-            now = datetime.now(IST)
 
-            # Interactive /status listener check
-            self.check_telegram_commands()
+            if not TELEGRAM_BOT_TOKEN:
 
-            if self.is_market_open():
-                # Entry scan
-                for sym in self.indices:
-                    if not self.indices[sym]["active"]:
-                        self.execute_live_order(sym)
-                        time.sleep(1)
+                time.sleep(5)
 
-                # Automatic Status update every 15 minutes (900 seconds)
-                if time.time() - last_pnl_check >= 900:
-                    send_telegram_msg(self.get_status_summary())
-                    last_pnl_check = time.time()
+                continue
 
-                # 03:15 PM Square-off
-                if now.hour == 15 and now.minute == 15 and not squared_off_today:
-                    self.close_all_trades()
-                    squared_off_today = True
+            try:
 
-            # Reset flag after market closes
-            if now.hour == 16:
-                squared_off_today = False
+                url = (
+                    "https://api.telegram.org/"
+                    f"bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+                )
 
-            time.sleep(5)
+                response = requests.get(
+                    url,
+                    params={
+                        "offset":
+                            self.last_update_id + 1,
+                        "timeout": 2
+                    },
+                    timeout=5
+                )
+
+                data = response.json()
+
+                for update in data.get(
+                    "result",
+                    []
+                ):
+
+                    self.last_update_id = (
+                        update["update_id"]
+                    )
+
+                    message = update.get(
+                        "message"
+                    )
+
+                    if not message:
+
+                        continue
+
+                    text = (
+                        message.get(
+                            "text",
+                            ""
+                        )
+                        .strip()
+                        .lower()
+                    )
+
+                    chat_id = str(
+                        message["chat"]["id"]
+                    )
+
+                    if (
+                        TELEGRAM_CHAT_ID
+                        and chat_id
+                        != str(
+                            TELEGRAM_CHAT_ID
+                        )
+                    ):
+
+                        continue
+
+                    # ----------------------------------------
+                    # STATUS
+                    # ----------------------------------------
+
+                    if text in [
+                        "/status",
+                        "status"
+                    ]:
+
+                        send_telegram(
+                            self.get_status()
+                        )
+
+                    # ----------------------------------------
+                    # RISK
+                    # ----------------------------------------
+
+                    elif text in [
+                        "/risk",
+                        "risk"
+                    ]:
+
+                        send_telegram(
+                            self.get_risk_report()
+                        )
+
+                    # ----------------------------------------
+                    # SIGNAL
+                    # ----------------------------------------
+
+                    elif text.startswith(
+                        "/signal"
+                    ):
+
+                        parts = text.split()
+
+                        if len(parts) >= 2:
+
+                            requested = parts[1]
+
+                            symbol_map = {
+                                "nifty":
+                                    "NIFTY 50",
+
+                                "banknifty":
+                                    "BANKNIFTY",
+
+                                "sensex":
+                                    "SENSEX"
+                            }
+
+                            symbol = (
+                                symbol_map.get(
+                                    requested
+                                )
+                            )
+
+                            if symbol:
+
+                                send_telegram(
+                                    self.get_signal_report(
+                                        symbol
+                                    )
+                                )
+
+                            else:
+
+                                send_telegram(
+                                    "Use:\n"
+                                    "`/signal nifty`\n"
+                                    "`/signal banknifty`\n"
+                                    "`/signal sensex`"
+                                )
+
+                        else:
+
+                            send_telegram(
+                                "Use:\n"
+                                "`/signal nifty`\n"
+                                "`/signal banknifty`\n"
+                                "`/signal sensex`"
+                            )
+
+                    # ----------------------------------------
+                    # START
+                    # ----------------------------------------
+
+                    elif text in [
+                        "/start",
+                        "start",
+                        "/help",
+                        "help"
+                    ]:
+
+                        send_telegram(
+                            "🤖 *ADVANCED HEDGING ENGINE*\n\n"
+                            "Commands:\n"
+                            "• `/status`\n"
+                            "• `/risk`\n"
+                            "• `/signal nifty`\n"
+                            "• `/signal banknifty`\n"
+                            "• `/signal sensex`\n\n"
+                            "🛡️ Mandatory hedging ON\n"
+                            "🚫 Naked selling OFF\n"
+                            "📊 Paper trading ON"
+                        )
+
+            except Exception as exc:
+
+                print(
+                    "Telegram listener error:",
+                    exc
+                )
+
+            time.sleep(1)
+
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    def run(self):
+
+        time.sleep(3)
+
+        send_telegram(
+            "🚀 *ADVANCED OPTIONS SELLING ENGINE LIVE*\n\n"
+            "🛡️ Mandatory Hedging: ON\n"
+            "🚫 Naked Selling: OFF\n"
+            "🧠 Multi-Factor Analysis: ON\n"
+            "🌡️ India VIX Filter: ON\n"
+            "📊 Option-Chain Sentiment: ON when available\n"
+            "🧯 Risk Protection: ON\n"
+            "📡 Telegram Listener: ON\n"
+            "📝 Paper Trading: ON\n\n"
+            "Use `/status` anytime."
+        )
+
+        # ----------------------------------------------------
+        # TELEGRAM THREAD
+        # ----------------------------------------------------
+
+        listener = threading.Thread(
+            target=self.telegram_listener,
+            daemon=True
+        )
+
+        listener.start()
+
+        while True:
+
+            try:
+
+                self.reset_new_day()
+
+                now = datetime.now(IST)
+
+                # ------------------------------------------------
+                # MARKET
+                # ------------------------------------------------
+
+                if self.is_market_open():
+
+                    # --------------------------------------------
+                    # DAILY LOSS STOP
+                    # --------------------------------------------
+
+                    if (
+                        self.daily_realized_pnl
+                        <= -MAX_DAILY_LOSS
+                    ):
+
+                        print(
+                            "Daily loss limit reached."
+                        )
+
+                    else:
+
+                        # ----------------------------------------
+                        # SYMBOL SCAN
+                        # ----------------------------------------
+
+                        for symbol in INDEX_CONFIG:
+
+                            try:
+
+                                self.evaluate_symbol(
+                                    symbol
+                                )
+
+                            except Exception as exc:
+
+                                print(
+                                    f"{symbol} evaluation error:",
+                                    exc
+                                )
+
+                            time.sleep(2)
+
+                    # --------------------------------------------
+                    # STATUS
+                    # --------------------------------------------
+
+                    if (
+                        time.time()
+                        - self.last_status_time
+                        >= STATUS_INTERVAL
+                    ):
+
+                        send_telegram(
+                            self.get_status()
+                        )
+
+                        self.last_status_time = (
+                            time.time()
+                        )
+
+                    # --------------------------------------------
+                    # 03:15 SQUARE-OFF
+                    # --------------------------------------------
+
+                    if (
+                        now.hour == 15
+                        and now.minute == 15
+                        and not self.squared_off_today
+                    ):
+
+                        self.close_all_positions()
+
+                        self.squared_off_today = True
+
+                # ------------------------------------------------
+                # AFTER MARKET
+                # ------------------------------------------------
+
+                if now.hour >= 16:
+
+                    self.squared_off_today = False
+
+                time.sleep(5)
+
+            except Exception as exc:
+
+                print(
+                    "MAIN LOOP ERROR:",
+                    exc
+                )
+
+                time.sleep(5)
+
+
+# ============================================================
+# START APPLICATION
+# ============================================================
 
 if __name__ == "__main__":
-    bot = RealisticPaperTradingBot()
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
+
+    bot = AdvancedHedgingBot()
+
+    server_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True
+    )
+
     server_thread.start()
-    bot.run_loop()
+
+    bot.run()
+```
