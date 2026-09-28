@@ -1,4 +1,3 @@
-```python
 import os
 import time
 import math
@@ -2928,7 +2927,6 @@ class AdvancedHedgingBot:
 # ============================================================
 
 if __name__ == "__main__":
-
     bot = AdvancedHedgingBot()
 
     server_thread = threading.Thread(
@@ -2939,4 +2937,3 @@ if __name__ == "__main__":
     server_thread.start()
 
     bot.run()
-```
