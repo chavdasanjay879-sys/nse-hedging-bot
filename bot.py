@@ -37,6 +37,20 @@ STATUS_INTERVAL = 900
 
 MAX_DAILY_LOSS = 5000.0
 
+# PROFIT LOCK: once running P&L reaches this amount,
+# the bot locks this minimum profit and closes all open
+# positions if running P&L falls back to the lock level.
+PROFIT_LOCK_TRIGGER = 5000.0
+PROFIT_LOCK_AMOUNT = 5000.0
+
+# TRAILING PROFIT LOCK
+# Once profit reaches the trigger, the bot remembers the highest
+# running P&L of the day and moves the protected floor upward.
+# The floor never moves downward.
+# 50% of every profit gained above the initial ₹5,000 trigger is
+# protected. Example: peak ₹7,000 -> floor ₹6,000.
+TRAILING_LOCK_SHARE = 0.50
+
 MIN_CONFIDENCE = 68
 
 MAX_VIX_FOR_NEW_TRADE = 30.0
@@ -1880,6 +1894,13 @@ class AdvancedHedgingBot:
 
         self.consecutive_losses = 0
 
+        # Profit-lock state for the current trading day.
+        self.profit_lock_active = False
+        self.profit_lock_level = PROFIT_LOCK_AMOUNT
+        self.profit_lock_triggered_at = 0.0
+        self.profit_peak = 0.0
+        self.profit_lock_alert_sent = False
+
         self.last_update_id = 0
 
         self.last_trade_time = {}
@@ -1945,6 +1966,12 @@ class AdvancedHedgingBot:
 
             self.consecutive_losses = 0
 
+            self.profit_lock_active = False
+            self.profit_lock_level = PROFIT_LOCK_AMOUNT
+            self.profit_lock_triggered_at = 0.0
+            self.profit_peak = 0.0
+            self.profit_lock_alert_sent = False
+
             self.squared_off_today = False
 
             for symbol in self.positions:
@@ -1970,6 +1997,12 @@ class AdvancedHedgingBot:
         self,
         symbol
     ):
+
+        if self.profit_lock_active:
+
+            return False, (
+                "Profit lock active for today"
+            )
 
         if (
             self.daily_realized_pnl
@@ -2221,6 +2254,136 @@ class AdvancedHedgingBot:
 
 
     # ========================================================
+    # PROFIT LOCK / TRAILING PROFIT PROTECTION
+    # ========================================================
+
+    def get_running_pnl(self):
+
+        total = 0.0
+
+        for symbol in INDEX_CONFIG:
+
+            position = self.positions[symbol]
+
+            if not position["active"]:
+                continue
+
+            trade = position["trade"]
+
+            df = get_market_data(symbol)
+
+            if df is not None:
+                spot = float(df["Close"].iloc[-1])
+            else:
+                spot = trade["spot"]
+
+            total += calculate_strategy_pnl(
+                trade,
+                spot,
+                get_india_vix()
+            )
+
+        return round(total, 2)
+
+
+    def check_profit_lock(self):
+
+        # Already locked/closed for the day.
+        if self.profit_lock_active:
+            return True
+
+        running_pnl = self.get_running_pnl()
+
+        # No active position = nothing to lock.
+        if running_pnl == 0.0:
+            return False
+
+        # Activate the lock when total open profit reaches ₹5,000.
+        if running_pnl >= PROFIT_LOCK_TRIGGER:
+
+            self.profit_lock_active = True
+            self.profit_lock_level = PROFIT_LOCK_AMOUNT
+            self.profit_lock_triggered_at = running_pnl
+            self.profit_peak = running_pnl
+
+            if not self.profit_lock_alert_sent:
+
+                send_telegram(
+                    "🔒 *PROFIT LOCK ACTIVATED*\n\n"
+                    f"💰 Running Profit: `₹{running_pnl:+,.2f}`\n"
+                    f"🛡️ Locked Minimum: `₹{PROFIT_LOCK_AMOUNT:,.2f}`\n"
+                    "🚫 New trades blocked for today.\n"
+                    "📉 If profit falls to the lock level, "
+                    "all open hedged positions will be closed."
+                )
+
+                self.profit_lock_alert_sent = True
+
+            return False
+
+        return False
+
+
+    def enforce_profit_lock(self):
+
+        if not self.profit_lock_active:
+            return False
+
+        running_pnl = self.get_running_pnl()
+
+        # ----------------------------------------------------
+        # TRAILING PROFIT LOCK
+        # ----------------------------------------------------
+        # Keep the highest running profit seen after activation.
+        # The protected floor can only move UP, never DOWN.
+        if running_pnl > self.profit_peak:
+
+            self.profit_peak = running_pnl
+
+            additional_profit = max(
+                0.0,
+                self.profit_peak - PROFIT_LOCK_TRIGGER
+            )
+
+            new_floor = (
+                PROFIT_LOCK_AMOUNT
+                + additional_profit * TRAILING_LOCK_SHARE
+            )
+
+            if new_floor > self.profit_lock_level:
+
+                old_floor = self.profit_lock_level
+                self.profit_lock_level = round(new_floor, 2)
+
+                send_telegram(
+                    "📈 *TRAILING PROFIT LOCK MOVED UP*\n\n"
+                    f"🏆 Peak Running Profit: `₹{self.profit_peak:,.2f}`\n"
+                    f"🔒 Old Floor: `₹{old_floor:,.2f}`\n"
+                    f"🛡️ New Protected Floor: `₹{self.profit_lock_level:,.2f}`"
+                )
+
+        # If profit reverses to the protected floor, close all
+        # open hedged positions and preserve the locked profit.
+        if running_pnl <= self.profit_lock_level:
+
+            send_telegram(
+                "🛑 *TRAILING PROFIT LOCK HIT*\n\n"
+                f"📉 Current Running P&L: `₹{running_pnl:+,.2f}`\n"
+                f"🏆 Peak Profit: `₹{self.profit_peak:,.2f}`\n"
+                f"🔒 Protected Profit Floor: `₹{self.profit_lock_level:,.2f}`\n"
+                "⚡ Closing all open hedged positions now."
+            )
+
+            self.close_all_positions(
+                reason="PROFIT LOCK"
+            )
+
+            return True
+
+        return False
+
+
+    # ========================================================
     # STATUS
     # ========================================================
 
@@ -2304,6 +2467,12 @@ class AdvancedHedgingBot:
                 "ℹ️ No active hedged positions."
             )
 
+        lock_status = (
+            f"🔒 ACTIVE — Floor ₹{self.profit_lock_level:,.2f}"
+            if self.profit_lock_active
+            else f"OFF — Trigger ₹{PROFIT_LOCK_TRIGGER:,.2f}"
+        )
+
         lines.extend([
             "━━━━━━━━━━━━━━━━━━",
             f"💵 *Running P&L:* "
@@ -2314,6 +2483,7 @@ class AdvancedHedgingBot:
             f"`₹{self.daily_realized_pnl:+,.2f}`",
             f"🛡️ *Daily Loss Limit:* "
             f"`₹{MAX_DAILY_LOSS:,.2f}`",
+            f"🔒 *Profit Lock:* `{lock_status}`",
             "⚠️ *Paper Trading Only*"
         ])
 
@@ -2475,12 +2645,12 @@ class AdvancedHedgingBot:
     # CLOSE ALL
     # ========================================================
 
-    def close_all_positions(self):
+    def close_all_positions(self, reason="INTRADAY SQUARE-OFF"):
 
         total_day_pnl = 0.0
 
         report = [
-            "🛑 *INTRADAY HEDGED SQUARE-OFF*",
+            f"🛑 *{reason}*",
             ""
         ]
 
@@ -2560,6 +2730,10 @@ class AdvancedHedgingBot:
         self.daily_realized_pnl += (
             total_day_pnl
         )
+
+        # Profit-lock closure means trading is finished for the day.
+        if reason == "PROFIT LOCK":
+            self.profit_lock_active = True
 
         roi = (
             (
@@ -2804,6 +2978,7 @@ class AdvancedHedgingBot:
             "🌡️ India VIX Filter: ON\n"
             "📊 Option-Chain Sentiment: ON when available\n"
             "🧯 Risk Protection: ON\n"
+            f"🔒 Profit Lock: ₹{PROFIT_LOCK_TRIGGER:,.0f} → ₹{PROFIT_LOCK_AMOUNT:,.0f}\n"
             "📡 Telegram Listener: ON\n"
             "📝 Paper Trading: ON\n\n"
             "Use `/status` anytime."
@@ -2835,6 +3010,22 @@ class AdvancedHedgingBot:
                 if self.is_market_open():
 
                     # --------------------------------------------
+                    # PROFIT LOCK CHECK
+                    # --------------------------------------------
+
+                    lock_hit = self.enforce_profit_lock()
+
+                    if not self.profit_lock_active:
+                        self.check_profit_lock()
+
+                    # If the lock just activated, do not open
+                    # another position in the same loop.
+                    if self.profit_lock_active and not lock_hit:
+                        print(
+                            "Profit lock active - new trades blocked."
+                        )
+
+                    # --------------------------------------------
                     # DAILY LOSS STOP
                     # --------------------------------------------
 
@@ -2847,7 +3038,7 @@ class AdvancedHedgingBot:
                             "Daily loss limit reached."
                         )
 
-                    else:
+                    elif not self.profit_lock_active:
 
                         # ----------------------------------------
                         # SYMBOL SCAN
