@@ -2305,6 +2305,7 @@ class AdvancedHedgingBot:
             self.profit_lock_level = PROFIT_LOCK_AMOUNT
             self.profit_lock_triggered_at = running_pnl
             self.profit_peak = running_pnl
+            self.profit_lock_exit_sent = False
 
             if not self.profit_lock_alert_sent:
 
@@ -2329,13 +2330,22 @@ class AdvancedHedgingBot:
         if not self.profit_lock_active:
             return False
 
+        # After the profit-lock exit has fired, do not repeat it.
+        if self.profit_lock_exit_sent:
+            return False
+
+        # If all positions are already closed, there is nothing to close.
+        active_positions = any(
+            self.positions[symbol]["active"]
+            for symbol in INDEX_CONFIG
+        )
+
+        if not active_positions:
+            return False
+
         running_pnl = self.get_running_pnl()
 
-        # ----------------------------------------------------
-        # TRAILING PROFIT LOCK
-        # ----------------------------------------------------
-        # Keep the highest running profit seen after activation.
-        # The protected floor can only move UP, never DOWN.
+        # TRAILING PROFIT LOCK: floor only moves upward.
         if running_pnl > self.profit_peak:
 
             self.profit_peak = running_pnl
@@ -2362,9 +2372,11 @@ class AdvancedHedgingBot:
                     f"🛡️ New Protected Floor: `₹{self.profit_lock_level:,.2f}`"
                 )
 
-        # If profit reverses to the protected floor, close all
-        # open hedged positions and preserve the locked profit.
+        # Close all open hedged positions exactly ONCE.
         if running_pnl <= self.profit_lock_level:
+
+            # Set BEFORE sending/closing so the next loop cannot repeat.
+            self.profit_lock_exit_sent = True
 
             send_telegram(
                 "🛑 *TRAILING PROFIT LOCK HIT*\n\n"
